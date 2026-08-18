@@ -527,13 +527,12 @@ pub struct FastPathMetadata {
 ///
 /// Conditions checked here:
 /// - (2, 3) `Range` is a SigV4-signed single explicit `bytes=X-Y`
-/// - (4)    `X-Dragonfly-Content-Length` is present and `> 0`
-/// - (5)    Piece length resolves from `piece_length_hint` or from the
-///          automatic strategy
+/// - (4) `X-Dragonfly-Content-Length` is present and `> 0`
+/// - (5) Piece length resolves from `piece_length_hint` or automatically
 /// - (6, 7, 8) `(start, end)` aligns exactly with one piece
-/// - (9)   **No `If-Range` header** — checked here rather than in the
-///         detection helpers so that `need_prefetch` continues to recognise
-///         signed ranges even when `If-Range` is present
+/// - (9) **No `If-Range` header** — checked here rather than in the
+///   detection helpers so that `need_prefetch` continues to recognise
+///   signed ranges even when `If-Range` is present
 pub fn fast_path_metadata(
     request_header: &HashMap<String, String>,
     url: &str,

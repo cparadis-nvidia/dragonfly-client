@@ -633,8 +633,7 @@ impl Piece {
                 // 200 with the full object, reading it would allocate the entire
                 // object (potentially gigabytes) only to discard it.
                 let msg = format!(
-                    "fast-path: expected 206 Partial Content for piece {} at offset {}, got {status}",
-                    piece_id, offset
+                    "fast-path: expected 206 Partial Content for piece {piece_id} at offset {offset}, got {status}",
                 );
                 error!("{}", msg);
                 return Err(Error::BackendError(Box::new(BackendError {
@@ -649,8 +648,7 @@ impl Piece {
             match content_range {
                 None => {
                     let msg = format!(
-                        "fast-path: missing or invalid Content-Range for piece {} at offset {}",
-                        piece_id, offset
+                        "fast-path: missing or invalid Content-Range for piece {piece_id} at offset {offset}",
                     );
                     error!("{}", msg);
                     return Err(Error::BackendError(Box::new(BackendError {
@@ -665,8 +663,7 @@ impl Piece {
                         let msg = format!(
                             "fast-path: Content-Range bytes={cr_start}-{cr_end}/... \
                              does not match expected bytes={offset}-{expected_end} \
-                             for piece {}",
-                            piece_id
+                             for piece {piece_id}",
                         );
                         error!("{}", msg);
                         return Err(Error::BackendError(Box::new(BackendError {
@@ -679,8 +676,7 @@ impl Piece {
                         let msg = format!(
                             "fast-path: Content-Range total {cr_total} != \
                              asserted content-length {asserted_content_length} \
-                             for piece {}",
-                            piece_id
+                             for piece {piece_id}",
                         );
                         error!("{}", msg);
                         return Err(Error::BackendError(Box::new(BackendError {

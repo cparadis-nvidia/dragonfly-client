@@ -48,7 +48,10 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_storage::{metadata, Storage};
 use dragonfly_client_util::{
-    http::{hashmap_to_headermap, headermap_to_hashmap, signature_bound_range_from_hashmap},
+    http::{
+        hashmap_to_headermap, headermap_to_hashmap, signature_bound_range_from_hashmap,
+        source_request_range,
+    },
     id_generator::IDGenerator,
     shutdown,
 };
@@ -150,18 +153,20 @@ impl Task {
 
     /// Updates the metadata of the task when the task downloads started.
     ///
-    /// **Fast-path shortcut:** when the caller has pre-set both
-    /// `request.actual_content_length` and `request.actual_piece_length` before
-    /// calling this function, the `bytes=0-0` stat preflight is skipped entirely.
-    /// This is used for SigV4-signed range requests whose `Range` cannot be
-    /// modified without invalidating the signature. The stat itself would return
-    /// 403 in that case because it sends `Range: bytes=0-0` while leaving the
-    /// original `Authorization` intact.
+    /// **Fast-path shortcut:** when `known_metadata` is `Some((content_length,
+    /// piece_length))`, the caller has already verified all alignment conditions
+    /// (SigV4-signed single-piece range, asserted total size, grid alignment)
+    /// and the `bytes=0-0` stat preflight is skipped entirely. The stat would
+    /// return 403 in this situation because it changes `Range` to `bytes=0-0`
+    /// while leaving the original `Authorization` intact.
+    ///
+    /// When `known_metadata` is `None` the normal stat path runs unchanged.
     #[instrument(skip_all)]
     pub async fn download_started(
         &self,
         id: &str,
         request: Download,
+        known_metadata: Option<(u64, u64)>,
     ) -> ClientResult<metadata::Task> {
         let (task, reused) = self.storage.prepare_download_task(id)?;
         if reused {
@@ -191,17 +196,15 @@ impl Task {
         }
 
         // ── Signed-range fast path ────────────────────────────────────────────
-        // When both actual_content_length and actual_piece_length are pre-set by
-        // the entry point (proxy or gRPC handler), the caller has already verified
-        // all alignment conditions and we can skip the bytes=0-0 stat preflight.
+        // When `known_metadata` is Some the caller (proxy/task.rs or gRPC
+        // handler) has already evaluated all gate conditions and we skip the
+        // bytes=0-0 stat preflight.
         //
-        // TRADE-OFF: there is no stat response on this path, so there is no ETag,
-        // Content-Type, or Accept-Ranges to echo in the task's response_header.
-        // Clients using the fast path (e.g., the model-streamer) do not read those
-        // headers from proxied responses, so this omission is acceptable.
-        if let (Some(content_length), Some(piece_length)) =
-            (request.actual_content_length, request.actual_piece_length)
-        {
+        // TRADE-OFF: there is no stat response on this path, so there is no
+        // ETag, Content-Type, or Accept-Ranges to echo in the task's
+        // response_header. Clients using the fast path (e.g. the model-streamer)
+        // do not read those headers from proxied responses, so this is acceptable.
+        if let Some((content_length, piece_length)) = known_metadata {
             info!(
                 "fast-path: skipping stat for task {id}, \
                  asserted content_length={content_length} piece_length={piece_length}"
@@ -1826,10 +1829,17 @@ impl Task {
                 Ok(metadata)
             }
 
-            // Compute preserve_range for this piece.
+            // Compute preserve_range for this piece using source_request_range.
             let preserve_range: Option<u64> = signed_range.and_then(|(sr_start, sr_end)| {
                 let sr_length = sr_end.saturating_sub(sr_start).saturating_add(1);
-                if interested_piece.offset == sr_start && interested_piece.length == sr_length {
+                if source_request_range(
+                    sr_start,
+                    sr_length,
+                    interested_piece.offset,
+                    interested_piece.length,
+                )
+                .is_none()
+                {
                     let cl = task.content_length()?;
                     debug!(
                         "fast-path (scheduler): piece {} offset={} length={} matched signed \
@@ -2407,12 +2417,19 @@ impl Task {
                 Ok(metadata)
             }
 
-            // Compute preserve_range for this piece: only active when the
-            // signed range exactly covers this piece's window.
+            // Compute preserve_range for this piece using source_request_range:
+            // returns None (forward verbatim) only when the signed range exactly
+            // covers this piece's window.
             let preserve_range: Option<u64> = signed_range.and_then(|(sr_start, sr_end)| {
                 let sr_length = sr_end.saturating_sub(sr_start).saturating_add(1);
-                if interested_piece.offset == sr_start && interested_piece.length == sr_length {
-                    // Fast path: pass content_length for fail-closed validation.
+                if source_request_range(
+                    sr_start,
+                    sr_length,
+                    interested_piece.offset,
+                    interested_piece.length,
+                )
+                .is_none()
+                {
                     let cl = task.content_length()?;
                     debug!(
                         "fast-path: piece {} offset={} length={} matched signed range \
@@ -2421,9 +2438,9 @@ impl Task {
                     );
                     Some(cl)
                 } else {
-                    // Signed range mismatch: fall back to the normal Range rewrite.
-                    // This is unreachable on a well-formed fast-path request (the gate
-                    // in make_download_task_request ensures exactly one piece).
+                    // Mismatch: fall back to the normal Range rewrite.
+                    // The gate in proxy/task.rs ensures exactly one piece; a mismatch
+                    // here is a bug.
                     warn!(
                         "fast-path: piece {} offset={} length={} does not match signed range \
                          bytes={sr_start}-{sr_end}, rewriting Range header",

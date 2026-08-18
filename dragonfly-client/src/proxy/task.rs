@@ -30,7 +30,7 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_util::{
     digest::is_blob_url,
-    http::{headermap_to_hashmap, parse_range_header},
+    http::{fast_path_metadata, headermap_to_hashmap, parse_range_header},
     id_generator::TaskIDParameter,
     types::redacted::RedactedDownload,
 };
@@ -123,10 +123,32 @@ pub async fn download(
     Span::current().record("task_id", task_id.as_str());
     Span::current().record("peer_id", peer_id.as_str());
 
+    // ── Signed-range fast-path gate (proxy path) ──────────────────────────────
+    // Evaluate all conditions adjacent to the download_started call that they
+    // guard. If the gate fires, pre-set download.range so the existing
+    // `if download.range.is_none()` block below is skipped, and pass
+    // known_metadata to download_started so it skips the stat preflight.
+    let fast_path = fast_path_metadata(
+        &download.request_header,
+        &download.url,
+        download.piece_length,
+    );
+    let known_metadata = fast_path.map(|fp| {
+        info!(
+            "fast-path (proxy): range bytes={}-{} content_length={} piece_length={}",
+            fp.signed_start, fp.signed_end, fp.content_length, fp.piece_length
+        );
+        download.range = Some(dragonfly_api::common::v2::Range {
+            start: fp.signed_start,
+            length: fp.signed_end - fp.signed_start + 1,
+        });
+        (fp.content_length, fp.piece_length)
+    });
+
     // Download task started.
     info!("download task started: {:?}", RedactedDownload(&download));
     let task = match task_manager
-        .download_started(task_id.as_str(), download.clone())
+        .download_started(task_id.as_str(), download.clone(), known_metadata)
         .await
     {
         Err(err @ ClientError::BackendError(_)) => {

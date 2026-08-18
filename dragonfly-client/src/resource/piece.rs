@@ -629,12 +629,9 @@ impl Piece {
         if let Some(asserted_content_length) = preserve_range {
             let status = response.http_status_code.unwrap_or_default();
             if status != reqwest::StatusCode::PARTIAL_CONTENT {
-                let mut buffer = String::new();
-                response
-                    .reader
-                    .read_to_string(&mut buffer)
-                    .await
-                    .unwrap_or_default();
+                // Drop the response body without reading — if the server returned
+                // 200 with the full object, reading it would allocate the entire
+                // object (potentially gigabytes) only to discard it.
                 let msg = format!(
                     "fast-path: expected 206 Partial Content for piece {} at offset {}, got {status}",
                     piece_id, offset

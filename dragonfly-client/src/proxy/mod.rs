@@ -16,10 +16,7 @@
 
 use crate::dynconfig::Dynconfig;
 use crate::grpc::REQUEST_TIMEOUT;
-use crate::resource::{
-    piece::{resolve_piece_length, PieceLengthStrategy, MAX_PIECE_LENGTH, MIN_PIECE_LENGTH},
-    task::Task,
-};
+use crate::resource::{piece::MIN_PIECE_LENGTH, task::Task};
 use bytes::Bytes;
 use dragonfly_api::common::v2::{Download, TaskType};
 use dragonfly_api::dfdaemon::v2::{
@@ -34,9 +31,7 @@ use dragonfly_client_metric::{
     collect_proxy_request_via_dfdaemon_metrics,
 };
 use dragonfly_client_util::{
-    http::{
-        hashmap_to_headermap, headermap_to_hashmap, is_aligned_single_piece, signature_bound_range,
-    },
+    http::{hashmap_to_headermap, headermap_to_hashmap, signature_bound_range},
     shutdown,
     tls::{generate_self_signed_certs_by_ca_cert, generate_simple_self_signed_certs, NoVerifier},
 };
@@ -1268,12 +1263,11 @@ fn make_registry_mirror_request(
 
 /// Makes a download task request by the request.
 ///
-/// When all signed-range fast-path conditions are met (SigV4-signed Range,
-/// single explicit `bytes=X-Y`, `X-Dragonfly-Content-Length` present, piece
-/// alignment valid, no `If-Range`), this function pre-sets
-/// `actual_content_length`, `actual_piece_length`, and `range` on the
-/// returned `Download` struct so that `Task::download_started` can skip the
-/// `bytes=0-0` stat preflight.
+/// The signed-range fast-path gate is evaluated in `proxy/task.rs::download`,
+/// immediately before the `Task::download_started` call it guards, so it is
+/// not duplicated here.  This function only handles request shaping (headers,
+/// URL rewriting, prefetch flag) that must happen before the request is
+/// handed off to the download pipeline.
 fn make_download_task_request(
     config: Arc<Config>,
     rule: &Rule,
@@ -1284,17 +1278,11 @@ fn make_download_task_request(
     let url_query = request.uri().query();
 
     // Validate the request arguments.
-    let piece_length_opt =
-        header::get_piece_length(header).map(|piece_length| piece_length.as_u64());
-    if let Some(pl) = piece_length_opt {
+    let piece_length = header::get_piece_length(header).map(|pl| pl.as_u64());
+    if let Some(pl) = piece_length {
         if pl < MIN_PIECE_LENGTH {
             return Err(ClientError::ValidationError(format!(
                 "piece length {pl} is less than the minimum piece length {MIN_PIECE_LENGTH}"
-            )));
-        }
-        if pl > MAX_PIECE_LENGTH {
-            return Err(ClientError::ValidationError(format!(
-                "piece length {pl} is greater than the maximum piece length {MAX_PIECE_LENGTH}"
             )));
         }
     }
@@ -1303,74 +1291,19 @@ fn make_download_task_request(
     let mut request_header = headermap_to_hashmap(header);
     request_header.remove(reqwest::header::HOST.as_str());
 
-    // ── Signed-range fast-path gate ───────────────────────────────────────────
-    // Conditions checked here (conditions 1, 2, 3, 9 via signature_bound_range;
-    // conditions 4-8 below):
-    //
-    // 1. GET routed via dfdaemon (handled by the caller before reaching here).
-    // 2. Range is SigV4-signed (Authorization or presigned URL).
-    // 3. Range is a single explicit bytes=X-Y.
-    // 4. X-Dragonfly-Content-Length present and > 0.
-    // 5. piece_length resolved (FixedPieceLength or OptimizeByFileLength).
-    // 6. Y < asserted_content_length.
-    // 7. X % piece_length == 0.
-    // 8. Exactly one piece.
-    // 9. No If-Range (checked inside signature_bound_range).
-    let fast_path = (|| -> Option<(u64, u64, u64, u64)> {
-        // Conditions 2, 3, 9.
-        let (sr_start, sr_end) = signature_bound_range(header, url_query)?;
-        // Condition 4.
-        let content_length = header::get_content_length(header)?;
-        // Condition 5.
-        let piece_length = match piece_length_opt {
-            Some(pl) => resolve_piece_length(PieceLengthStrategy::FixedPieceLength(pl)),
-            None => resolve_piece_length(PieceLengthStrategy::OptimizeByFileLength(content_length)),
-        };
-        // Conditions 6, 7, 8.
-        if !is_aligned_single_piece(sr_start, sr_end, piece_length, content_length) {
-            debug!(
-                "fast-path: skipped — range bytes={sr_start}-{sr_end} is not \
-                 aligned with a single piece (piece_length={piece_length}, \
-                 content_length={content_length})"
-            );
-            return None;
-        }
-        Some((sr_start, sr_end, piece_length, content_length))
-    })();
-
     // Strip X-Dragonfly-Content-Length before forwarding to the origin.
-    // It is a dfdaemon-internal hint and must not reach the origin server.
-    request_header.remove(header::DRAGONFLY_CONTENT_LENGTH_HEADER);
-
-    // Derive range and fast-path pre-set fields.
-    let (download_range, actual_content_length, actual_piece_length) =
-        if let Some((sr_start, sr_end, piece_length, content_length)) = fast_path {
-            info!(
-                "fast-path: hit for range bytes={sr_start}-{sr_end}, \
-                 content_length={content_length}, piece_length={piece_length}"
-            );
-            let range = dragonfly_api::common::v2::Range {
-                start: sr_start,
-                length: sr_end - sr_start + 1,
-            };
-            (Some(range), Some(content_length), Some(piece_length))
-        } else {
-            if signature_bound_range(header, url_query).is_some() {
-                debug!(
-                    "fast-path: fallback — signed Range present but conditions not fully met; \
-                     proceeding with normal stat (will likely 403)"
-                );
-            }
-            (None, None, None)
-        };
+    // It is a dfdaemon-internal hint that must not reach the origin server.
+    // Use retain for a case-insensitive removal — headermap_to_hashmap lower-
+    // cases header names, so the key may be "x-dragonfly-content-length".
+    request_header.retain(|k, _| !k.eq_ignore_ascii_case(header::DRAGONFLY_CONTENT_LENGTH_HEADER));
 
     Ok(DownloadTaskRequest {
         download: Some(Download {
             url: make_download_url(request.uri(), rule.use_tls, rule.redirect.as_deref())?,
             digest: None,
-            // When the fast path is active, range is pre-set to the signed range;
-            // otherwise it is derived from the Range request header after download_started.
-            range: download_range,
+            // Range is derived from the request header after download_started,
+            // or pre-set by the fast-path gate in proxy/task.rs.
+            range: None,
             r#type: TaskType::Standard as i32,
             tag: header::get_tag(header),
             application: header::get_application(header),
@@ -1380,7 +1313,7 @@ fn make_download_task_request(
                 &rule.filtered_query_params,
             ),
             request_header,
-            piece_length: piece_length_opt,
+            piece_length,
             // Need the absolute path.
             output_path: header::get_output_path(header),
             timeout: None,
@@ -1399,9 +1332,8 @@ fn make_download_task_request(
             remote_ip: Some(remote_ip.to_string()),
             concurrent_piece_count: Some(config.download.concurrent_piece_count),
             overwrite: false,
-            // Pre-set on fast path so Task::download_started can skip the stat.
-            actual_piece_length,
-            actual_content_length,
+            actual_piece_length: None,
+            actual_content_length: None,
             actual_piece_count: None,
             enable_task_id_based_blob_digest: header::get_enable_task_id_based_blob_digest(
                 header,
@@ -1560,4 +1492,37 @@ fn empty() -> BoxBody<Bytes, ClientError> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::header::DRAGONFLY_CONTENT_LENGTH_HEADER;
+    use std::collections::HashMap;
+
+    /// Verify the case-insensitive retain used in make_download_task_request
+    /// strips X-Dragonfly-Content-Length regardless of the casing that the
+    /// client sends (headermap_to_hashmap lowercases, but the HashMap may also
+    /// hold the header under its original casing when set by gRPC callers).
+    #[test]
+    fn content_length_strip_is_case_insensitive() {
+        for casing in &[
+            "x-dragonfly-content-length",
+            "X-Dragonfly-Content-Length",
+            "X-DRAGONFLY-CONTENT-LENGTH",
+        ] {
+            let mut hdr: HashMap<String, String> = HashMap::new();
+            hdr.insert((*casing).to_string(), "10485760".to_string());
+            hdr.insert("range".to_string(), "bytes=0-4194303".to_string());
+
+            hdr.retain(|k, _| !k.eq_ignore_ascii_case(DRAGONFLY_CONTENT_LENGTH_HEADER));
+
+            assert!(
+                !hdr.keys()
+                    .any(|k| k.eq_ignore_ascii_case(DRAGONFLY_CONTENT_LENGTH_HEADER)),
+                "Header '{casing}' was not stripped"
+            );
+            // Unrelated keys must survive.
+            assert!(hdr.contains_key("range"));
+        }
+    }
 }

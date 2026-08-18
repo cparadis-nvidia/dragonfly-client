@@ -301,8 +301,16 @@ pub fn is_range_signed_in_presigned_url(query: &str) -> bool {
 /// - open-ended (`bytes=X-`)
 /// - suffix (`bytes=-N`)
 /// - start > end
+///
+/// The range unit comparison is case-insensitive per RFC 7233.
 pub fn is_single_byte_range(range: &str) -> Option<(u64, u64)> {
-    let rest = range.trim().strip_prefix("bytes=")?;
+    let trimmed = range.trim();
+    // Case-insensitive "bytes=" prefix (RFC 7233 §2.1: range units are case-insensitive).
+    let rest = if trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("bytes=") {
+        &trimmed[6..]
+    } else {
+        return None;
+    };
     // Reject multi-range.
     if rest.contains(',') {
         return None;
@@ -322,25 +330,23 @@ pub fn is_single_byte_range(range: &str) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-/// If the request has a SigV4-signed single explicit `bytes=X-Y` `Range`
-/// header and **no** `If-Range` header, returns `(start, end)`. Returns
-/// `None` otherwise.
+/// Returns `(start, end)` if the request has a SigV4-signed single explicit
+/// `bytes=X-Y` `Range` header. Returns `None` otherwise.
 ///
-/// `url_query` is the raw query string from the request URL; it is used to
-/// detect presigned URLs.  Pass `None` when the URL is not available.
+/// **Does NOT check `If-Range`** — that policy condition belongs to the
+/// fast-path gate ([`fast_path_metadata`]), not in the detection helper, so
+/// callers such as `need_prefetch` can correctly suppress whole-object
+/// prefetch even when `If-Range` is present.
 ///
-/// Conditions checked (fast-path gate conditions 2, 3, 9):
-/// - No `If-Range` header (condition 9)
-/// - `Range` present (condition 2 prerequisite)
-/// - `Range` is a single explicit `bytes=X-Y` (condition 3)
+/// `url_query` is the raw query string from the request URL; pass `None`
+/// when not available.
+///
+/// Conditions checked (fast-path gate conditions 2, 3):
+/// - `Range` is present and a single explicit `bytes=X-Y` (condition 3)
 /// - `Authorization` header signed with AWS SigV4 and `range` in
 ///   `SignedHeaders`, OR presigned URL with `X-Amz-Algorithm`,
 ///   `X-Amz-Signature`, and `range` in `X-Amz-SignedHeaders` (condition 2)
 pub fn signature_bound_range(header: &HeaderMap, url_query: Option<&str>) -> Option<(u64, u64)> {
-    // Condition 9: reject If-Range.
-    if header.contains_key("if-range") {
-        return None;
-    }
     // Range must be present.
     let range_value = header
         .get(reqwest::header::RANGE)
@@ -359,15 +365,13 @@ pub fn signature_bound_range(header: &HeaderMap, url_query: Option<&str>) -> Opt
 /// Same as [`signature_bound_range`] but operates on a
 /// `HashMap<String, String>` (as stored in `Download::request_header`).
 ///
+/// **Does NOT check `If-Range`** — see [`signature_bound_range`].
+///
 /// `url_query` is the raw query string extracted from the download URL.
 pub fn signature_bound_range_from_hashmap(
     header: &HashMap<String, String>,
     url_query: Option<&str>,
 ) -> Option<(u64, u64)> {
-    // Condition 9: reject If-Range.
-    if header.keys().any(|k| k.eq_ignore_ascii_case("if-range")) {
-        return None;
-    }
     // Range must be present.
     let range_value = header
         .iter()
@@ -483,6 +487,105 @@ pub fn source_request_range(
             length: piece_length,
         })
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Signed-range fast-path gate
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Maximum piece count used when computing automatic piece length.
+/// Mirrors `piece.rs::MAX_PIECE_COUNT`.
+const MAX_PIECE_COUNT: u64 = 500;
+
+/// Minimum piece length (4 MiB). Mirrors `dragonfly_client_config::MIN_PIECE_LENGTH`.
+/// Inlined to avoid a dependency on `dragonfly-client-config` from this crate.
+const MIN_PIECE_LENGTH_FAST_PATH: u64 = 4 * 1024 * 1024;
+
+/// Maximum piece length (64 MiB), mirroring `piece::MAX_PIECE_LENGTH`.
+const MAX_PIECE_LENGTH_FAST_PATH: u64 = 64 * 1024 * 1024;
+
+/// Resolved metadata returned by [`fast_path_metadata`] when all fast-path
+/// conditions are satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FastPathMetadata {
+    /// Start of the signed `Range` (source-object coordinates).
+    pub signed_start: u64,
+    /// End of the signed `Range` (source-object coordinates, inclusive).
+    pub signed_end: u64,
+    /// Asserted total object size from `X-Dragonfly-Content-Length`.
+    pub content_length: u64,
+    /// Resolved piece length.
+    pub piece_length: u64,
+}
+
+/// Evaluates all signed-range fast-path conditions against a `Download`
+/// request header map and returns the resolved metadata when every condition
+/// holds.
+///
+/// The caller is responsible for stripping `X-Dragonfly-Content-Length` from
+/// the header map before forwarding it to the origin.
+///
+/// Conditions checked here:
+/// - (2, 3) `Range` is a SigV4-signed single explicit `bytes=X-Y`
+/// - (4)    `X-Dragonfly-Content-Length` is present and `> 0`
+/// - (5)    Piece length resolves from `piece_length_hint` or from the
+///          automatic strategy
+/// - (6, 7, 8) `(start, end)` aligns exactly with one piece
+/// - (9)   **No `If-Range` header** — checked here rather than in the
+///         detection helpers so that `need_prefetch` continues to recognise
+///         signed ranges even when `If-Range` is present
+pub fn fast_path_metadata(
+    request_header: &HashMap<String, String>,
+    url: &str,
+    piece_length_hint: Option<u64>,
+) -> Option<FastPathMetadata> {
+    // Condition 9: reject If-Range here (not in the detection helpers).
+    if request_header
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("if-range"))
+    {
+        return None;
+    }
+
+    // Conditions 2, 3 (without If-Range filter — that is checked above).
+    let url_query = url.find('?').map(|i| &url[i + 1..]);
+    let (sr_start, sr_end) = signature_bound_range_from_hashmap(request_header, url_query)?;
+
+    // Condition 4.
+    let content_length = request_header
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-dragonfly-content-length"))
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)?;
+
+    // Condition 5: resolve piece length.
+    let piece_length = match piece_length_hint {
+        Some(pl) if pl >= MIN_PIECE_LENGTH_FAST_PATH => pl,
+        _ => {
+            let raw = (content_length as f64 / MAX_PIECE_COUNT as f64) as u64;
+            let actual = raw.next_power_of_two();
+            match (
+                actual > MIN_PIECE_LENGTH_FAST_PATH,
+                actual < MAX_PIECE_LENGTH_FAST_PATH,
+            ) {
+                (true, true) => actual,
+                (_, false) => MAX_PIECE_LENGTH_FAST_PATH,
+                (false, _) => MIN_PIECE_LENGTH_FAST_PATH,
+            }
+        }
+    };
+
+    // Conditions 6, 7, 8.
+    if !is_aligned_single_piece(sr_start, sr_end, piece_length, content_length) {
+        return None;
+    }
+
+    Some(FastPathMetadata {
+        signed_start: sr_start,
+        signed_end: sr_end,
+        content_length,
+        piece_length,
+    })
 }
 
 #[cfg(test)]
@@ -735,6 +838,9 @@ mod tests {
             Some((4194304, 8388607))
         );
         assert_eq!(is_single_byte_range("bytes=0-0"), Some((0, 0)));
+        // Case-insensitive unit (RFC 7233 §2.1).
+        assert_eq!(is_single_byte_range("Bytes=0-999"), Some((0, 999)));
+        assert_eq!(is_single_byte_range("BYTES=0-999"), Some((0, 999)));
 
         // Open-ended.
         assert_eq!(is_single_byte_range("bytes=100-"), None);
@@ -761,10 +867,11 @@ mod tests {
         hdr.insert(reqwest::header::RANGE, "bytes=0-4194303".parse().unwrap());
         assert_eq!(signature_bound_range(&hdr, None), Some((0, 4194303)));
 
-        // If-Range present → None.
+        // If-Range present → signature_bound_range still returns Some
+        // (If-Range is NOT checked here; it is a policy gate in fast_path_metadata).
         let mut hdr2 = hdr.clone();
         hdr2.insert("if-range", "\"etag\"".parse().unwrap());
-        assert_eq!(signature_bound_range(&hdr2, None), None);
+        assert_eq!(signature_bound_range(&hdr2, None), Some((0, 4194303)));
 
         // Range not signature-bound.
         let mut hdr3 = HeaderMap::new();
@@ -789,6 +896,88 @@ mod tests {
         let mut hdr6 = HeaderMap::new();
         hdr6.insert(reqwest::header::RANGE, "bytes=0-4194303".parse().unwrap());
         assert_eq!(signature_bound_range(&hdr6, Some(q)), Some((0, 4194303)));
+    }
+
+    // ── fast_path_metadata tests ─────────────────────────────────────────────
+
+    fn make_auth() -> &'static str {
+        "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, \
+         SignedHeaders=host;range;x-amz-date, Signature=abc123"
+    }
+
+    fn signed_hashmap(range: &str, content_length: u64) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("authorization".to_string(), make_auth().to_string());
+        m.insert("range".to_string(), range.to_string());
+        m.insert(
+            "x-dragonfly-content-length".to_string(),
+            content_length.to_string(),
+        );
+        m
+    }
+
+    #[test]
+    fn test_fast_path_metadata_happy_path() {
+        const PL: u64 = 4 * 1024 * 1024;
+        const CL: u64 = 10 * PL;
+        let hdr = signed_hashmap("bytes=0-4194303", CL);
+        let fp = fast_path_metadata(&hdr, "https://s3.example.com/bucket/key", Some(PL)).unwrap();
+        assert_eq!(fp.signed_start, 0);
+        assert_eq!(fp.signed_end, PL - 1);
+        assert_eq!(fp.content_length, CL);
+        assert_eq!(fp.piece_length, PL);
+    }
+
+    #[test]
+    fn test_fast_path_metadata_if_range_rejected() {
+        const PL: u64 = 4 * 1024 * 1024;
+        const CL: u64 = 10 * PL;
+        let mut hdr = signed_hashmap("bytes=0-4194303", CL);
+        // If-Range must block the fast path (condition 9).
+        hdr.insert("If-Range".to_string(), "\"etag\"".to_string());
+        assert!(fast_path_metadata(&hdr, "https://s3.example.com/bucket/key", Some(PL)).is_none());
+    }
+
+    #[test]
+    fn test_fast_path_metadata_missing_content_length() {
+        const PL: u64 = 4 * 1024 * 1024;
+        let mut hdr = HashMap::new();
+        hdr.insert("authorization".to_string(), make_auth().to_string());
+        hdr.insert("range".to_string(), "bytes=0-4194303".to_string());
+        // No X-Dragonfly-Content-Length → None.
+        assert!(fast_path_metadata(&hdr, "https://s3.example.com/key", Some(PL)).is_none());
+    }
+
+    #[test]
+    fn test_fast_path_metadata_zero_content_length_rejected() {
+        const PL: u64 = 4 * 1024 * 1024;
+        let mut hdr = HashMap::new();
+        hdr.insert("authorization".to_string(), make_auth().to_string());
+        hdr.insert("range".to_string(), "bytes=0-4194303".to_string());
+        hdr.insert("x-dragonfly-content-length".to_string(), "0".to_string());
+        assert!(fast_path_metadata(&hdr, "https://s3.example.com/key", Some(PL)).is_none());
+    }
+
+    #[test]
+    fn test_fast_path_metadata_case_insensitive_header_keys() {
+        // X-Dragonfly-Content-Length in mixed case must be found.
+        const PL: u64 = 4 * 1024 * 1024;
+        const CL: u64 = 10 * PL;
+        let mut hdr = HashMap::new();
+        hdr.insert("Authorization".to_string(), make_auth().to_string());
+        hdr.insert("Range".to_string(), "bytes=0-4194303".to_string());
+        hdr.insert("X-Dragonfly-Content-Length".to_string(), CL.to_string());
+        let fp = fast_path_metadata(&hdr, "https://s3.example.com/bucket/key", Some(PL)).unwrap();
+        assert_eq!(fp.content_length, CL);
+    }
+
+    #[test]
+    fn test_fast_path_metadata_misaligned_rejected() {
+        const PL: u64 = 4 * 1024 * 1024;
+        const CL: u64 = 10 * PL;
+        // Start not piece-aligned.
+        let hdr = signed_hashmap("bytes=1-4194304", CL);
+        assert!(fast_path_metadata(&hdr, "https://s3.example.com/key", Some(PL)).is_none());
     }
 
     // ── Alignment predicate ──────────────────────────────────────────────────

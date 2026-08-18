@@ -74,6 +74,17 @@ pub const DRAGONFLY_FORCE_HARD_LINK_HEADER: &str = "X-Dragonfly-Force-Hard-Link"
 /// to 4mib, for example: 4mib, 1gib
 pub const DRAGONFLY_PIECE_LENGTH_HEADER: &str = "X-Dragonfly-Piece-Length";
 
+/// The header key of the total content length asserted by the client.
+///
+/// When the client knows the object's total size without performing a preflight
+/// request (e.g., it read the safetensors header directly and obtained the
+/// `Content-Range` total), it passes this header so that dfdaemon can skip the
+/// `bytes=0-0` stat preflight for signature-bound range requests. The value
+/// must be a decimal `u64 > 0`.
+///
+/// This header is stripped before forwarding the request to the origin.
+pub const DRAGONFLY_CONTENT_LENGTH_HEADER: &str = "X-Dragonfly-Content-Length";
+
 /// The header key of content for calculating task id.
 /// If DRAGONFLY_CONTENT_FOR_CALCULATING_TASK_ID_HEADER is set, use its value to calculate the task ID.
 /// Otherwise, calculate the task ID based on `url`, `piece_length`, `tag`, `application`, and `filtered_query_params`.
@@ -295,6 +306,19 @@ pub fn get_piece_length(header: &HeaderMap) -> Option<ByteSize> {
     }
 }
 
+/// Get X-Dragonfly-Content-Length header value as a `u64`.
+///
+/// Returns `Some(n)` where `n > 0` when the header is present and parses
+/// successfully.  Returns `None` if the header is absent, non-numeric, zero,
+/// or overflows `u64`.
+pub fn get_content_length(header: &HeaderMap) -> Option<u64> {
+    header
+        .get(DRAGONFLY_CONTENT_LENGTH_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+}
+
 /// Get X-Dragonfly-Content-For-Calculating-Task-ID header value to determine the content for
 /// calculating task ID.
 pub fn get_content_for_calculating_task_id(header: &HeaderMap) -> Option<String> {
@@ -479,6 +503,33 @@ mod tests {
 
         headers.insert(DRAGONFLY_PIECE_LENGTH_HEADER, HeaderValue::from_static("0"));
         assert_eq!(get_piece_length(&headers), Some(ByteSize::b(0)));
+    }
+
+    #[test]
+    fn test_get_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            DRAGONFLY_CONTENT_LENGTH_HEADER,
+            HeaderValue::from_static("10485760"),
+        );
+        assert_eq!(get_content_length(&headers), Some(10485760u64));
+
+        // Zero → None.
+        headers.insert(
+            DRAGONFLY_CONTENT_LENGTH_HEADER,
+            HeaderValue::from_static("0"),
+        );
+        assert_eq!(get_content_length(&headers), None);
+
+        // Non-numeric → None.
+        headers.insert(
+            DRAGONFLY_CONTENT_LENGTH_HEADER,
+            HeaderValue::from_static("abc"),
+        );
+        assert_eq!(get_content_length(&headers), None);
+
+        // Absent → None.
+        assert_eq!(get_content_length(&HeaderMap::new()), None);
     }
 
     #[test]

@@ -16,7 +16,11 @@
 
 use crate::dynconfig::block_list::{DownloadBlockListCheckParams, UploadBlockListCheckParams};
 use crate::dynconfig::Dynconfig;
-use crate::resource::{persistent_cache_task, persistent_task, task};
+use crate::resource::{
+    persistent_cache_task, persistent_task,
+    piece::{resolve_piece_length, PieceLengthStrategy, MIN_PIECE_LENGTH},
+    task,
+};
 use dragonfly_api::common::v2::{
     CacheTask, PersistentCacheTask, PersistentTask, Priority, Task, TaskType,
 };
@@ -62,7 +66,10 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_util::{
     digest::{is_blob_url, verify_file_digest, Digest},
-    http::{hashmap_to_headermap, headermap_to_hashmap, parse_range_header},
+    http::{
+        hashmap_to_headermap, headermap_to_hashmap, is_aligned_single_piece, parse_range_header,
+        signature_bound_range_from_hashmap,
+    },
     id_generator::{PersistentCacheTaskIDParameter, PersistentTaskIDParameter, TaskIDParameter},
     ratelimiter::bbr::BBR,
     shutdown,
@@ -388,6 +395,59 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
             "remote_ip",
             download.remote_ip.clone().unwrap_or_default().as_str(),
         );
+
+        // ── Signed-range fast-path gate (gRPC path) ───────────────────────────
+        // Mirror the proxy fast-path detection for gRPC clients that send
+        // X-Dragonfly-Content-Length and a SigV4-signed Range. Pre-set
+        // actual_content_length and actual_piece_length so that
+        // Task::download_started skips the bytes=0-0 stat preflight.
+        {
+            let url_query = download.url.find('?').map(|i| &download.url[i + 1..]);
+            if let Some((sr_start, sr_end)) =
+                signature_bound_range_from_hashmap(&download.request_header, url_query)
+            {
+                let asserted_cl = download
+                    .request_header
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("x-dragonfly-content-length"))
+                    .and_then(|(_, v)| v.parse::<u64>().ok())
+                    .filter(|&n| n > 0);
+
+                if let Some(content_length) = asserted_cl {
+                    let piece_length = match download.piece_length {
+                        Some(pl) if pl >= MIN_PIECE_LENGTH => {
+                            resolve_piece_length(PieceLengthStrategy::FixedPieceLength(pl))
+                        }
+                        _ => resolve_piece_length(PieceLengthStrategy::OptimizeByFileLength(
+                            content_length,
+                        )),
+                    };
+
+                    if is_aligned_single_piece(sr_start, sr_end, piece_length, content_length) {
+                        info!(
+                            "fast-path (gRPC): hit for range bytes={sr_start}-{sr_end}, \
+                             content_length={content_length}, piece_length={piece_length}"
+                        );
+                        download.actual_content_length = Some(content_length);
+                        download.actual_piece_length = Some(piece_length);
+                        download.range = Some(dragonfly_api::common::v2::Range {
+                            start: sr_start,
+                            length: sr_end - sr_start + 1,
+                        });
+                    } else {
+                        debug!(
+                            "fast-path (gRPC): skipped — range bytes={sr_start}-{sr_end} \
+                             is not aligned with a single piece (piece_length={piece_length}, \
+                             content_length={content_length})"
+                        );
+                    }
+                }
+            }
+
+            // Strip X-Dragonfly-Content-Length before forwarding to the origin.
+            download.request_header.remove("x-dragonfly-content-length");
+            download.request_header.remove("X-Dragonfly-Content-Length");
+        }
 
         // Download task started.
         info!("download task started: {:?}", RedactedDownload(&download));

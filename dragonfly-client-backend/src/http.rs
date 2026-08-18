@@ -1933,4 +1933,146 @@ LJ8gCHKBOJy9dW62DcRWw6zzlTtt9y18/Btx0Hpawg==
         assert_eq!(response.http_status_code, Some(StatusCode::OK));
         assert_eq!(response.text().await.unwrap(), "target content");
     }
+
+    // ── Signed-range fast-path integration tests ─────────────────────────────
+    //
+    // These tests verify the HTTP backend behaviour that the fast-path relies on:
+    //
+    // 1. `get` with `range: None` leaves the Range header from `http_header`
+    //    untouched (make_request_headers does NOT insert a Range when None).
+    // 2. `get` with `range: Some(...)` overwrites the Range header.
+    // 3. `stat` always sends `Range: bytes=0-0` regardless of the request_header.
+    //
+    // The task-level fast path skips `stat` entirely and calls `get` with
+    // `range: None`, so the SigV4-signed Range header reaches the origin
+    // byte-for-byte.
+
+    /// When `range: None` is passed, `make_request_headers` must NOT insert a
+    /// Range header. The server therefore receives the Range that was already in
+    /// `http_header` (the client's signed Range), verbatim.
+    #[tokio::test]
+    async fn fast_path_get_with_range_none_forwards_header_verbatim() {
+        use wiremock::matchers::header;
+
+        let server = wiremock::MockServer::start().await;
+
+        // Assert that the request carries the exact signed Range the client set,
+        // and NOT `bytes=0-0` (which stat would have used).
+        Mock::given(method("GET"))
+            .and(path("/object/key"))
+            .and(header("Range", "bytes=4194304-8388607"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 4194304-8388607/16777216")
+                    .insert_header("Content-Length", "4194304")
+                    .set_body_bytes(vec![0u8; 4194304]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // A second mock rejects any request with Range: bytes=0-0 to verify
+        // the fast path never sends the stat preflight.
+        Mock::given(method("GET"))
+            .and(path("/object/key"))
+            .and(header("Range", "bytes=0-0"))
+            .respond_with(ResponseTemplate::new(403))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut req_header = HeaderMap::new();
+        req_header.insert(
+            reqwest::header::RANGE,
+            "bytes=4194304-8388607".parse().unwrap(),
+        );
+        req_header.insert(
+            reqwest::header::AUTHORIZATION,
+            "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;range, Signature=abc123"
+                .parse()
+                .unwrap(),
+        );
+
+        let backend =
+            HTTP::new(HTTP_SCHEME, None, 1, false, Duration::from_secs(60), false).unwrap();
+
+        // Fast path: range: None → backend does not rewrite Range header.
+        let response = backend
+            .get(GetRequest {
+                task_id: "test-task".to_string(),
+                piece_id: "test-piece".to_string(),
+                url: format!("{}/object/key", server.uri()),
+                range: None,
+                http_header: Some(req_header),
+                timeout: Duration::from_secs(5),
+                client_cert: None,
+                object_storage: None,
+                hdfs: None,
+                hugging_face: None,
+                model_scope: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.http_status_code, Some(StatusCode::PARTIAL_CONTENT));
+        server.verify().await;
+    }
+
+    /// When `range: Some(Range { start: 0, length: 1 })` is passed (as `stat`
+    /// does), `make_request_headers` overwrites the Range header to `bytes=0-0`.
+    #[tokio::test]
+    async fn normal_path_get_with_range_some_overwrites_header() {
+        use dragonfly_api::common::v2::Range as DfRange;
+
+        let server = wiremock::MockServer::start().await;
+
+        // The backend must send bytes=0-0, not the original bytes=4194304-8388607.
+        Mock::given(method("GET"))
+            .and(path("/object/key"))
+            .and(header("Range", "bytes=0-0"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("Content-Range", "bytes 0-0/16777216")
+                    .insert_header("Content-Length", "1")
+                    .set_body_bytes(vec![0u8; 1]),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut req_header = HeaderMap::new();
+        // The request_header has a Range from the client, but range: Some(...) should overwrite it.
+        req_header.insert(
+            reqwest::header::RANGE,
+            "bytes=4194304-8388607".parse().unwrap(),
+        );
+
+        let backend =
+            HTTP::new(HTTP_SCHEME, None, 1, false, Duration::from_secs(60), false).unwrap();
+
+        // Normal stat path: range: Some → rewrites to bytes=0-0.
+        let response = backend
+            .get(GetRequest {
+                task_id: "test-task".to_string(),
+                piece_id: "test-piece".to_string(),
+                url: format!("{}/object/key", server.uri()),
+                range: Some(DfRange {
+                    start: 0,
+                    length: 1,
+                }),
+                http_header: Some(req_header),
+                timeout: Duration::from_secs(5),
+                client_cert: None,
+                object_storage: None,
+                hdfs: None,
+                hugging_face: None,
+                model_scope: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.http_status_code, Some(StatusCode::PARTIAL_CONTENT));
+        server.verify().await;
+    }
 }

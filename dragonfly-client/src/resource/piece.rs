@@ -25,7 +25,7 @@ use dragonfly_client_metric::{
     collect_backend_request_started_metrics, collect_download_piece_traffic_metrics,
 };
 use dragonfly_client_storage::{io::RangeReader, metadata, Storage};
-use dragonfly_client_util::net::format_socket_addr;
+use dragonfly_client_util::{http::get_content_range, net::format_socket_addr};
 use leaky_bucket::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::collections::HashMap;
@@ -42,6 +42,25 @@ pub use dragonfly_client_config::MIN_PIECE_LENGTH;
 
 /// The maximum piece length.
 pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
+
+/// Resolves the piece length from the given strategy without requiring a
+/// `Piece` instance. The `Piece::calculate_piece_length` method delegates to
+/// this function.
+pub fn resolve_piece_length(strategy: PieceLengthStrategy) -> u64 {
+    const MAX_PIECE_COUNT: u64 = 500;
+    match strategy {
+        PieceLengthStrategy::FixedPieceLength(pl) => pl,
+        PieceLengthStrategy::OptimizeByFileLength(cl) => {
+            let pl = (cl as f64 / MAX_PIECE_COUNT as f64) as u64;
+            let actual = pl.next_power_of_two();
+            match (actual > MIN_PIECE_LENGTH, actual < MAX_PIECE_LENGTH) {
+                (true, true) => actual,
+                (_, false) => MAX_PIECE_LENGTH,
+                (false, _) => MIN_PIECE_LENGTH,
+            }
+        }
+    }
+}
 
 /// Sets the optimization strategy of piece length.
 pub enum PieceLengthStrategy {
@@ -291,28 +310,7 @@ impl Piece {
 
     /// Calculates the piece size by content_length.
     pub fn calculate_piece_length(&self, strategy: PieceLengthStrategy) -> u64 {
-        // The maximum piece count. If the piece count is upper than
-        // MAX_PIECE_COUNT, the piece length will be optimized by the file
-        // length. When piece length became the MAX_PIECE_LENGTH, the piece
-        // count probably will be upper than MAX_PIECE_COUNT.
-        const MAX_PIECE_COUNT: u64 = 500;
-
-        match strategy {
-            PieceLengthStrategy::OptimizeByFileLength(content_length) => {
-                let piece_length = (content_length as f64 / MAX_PIECE_COUNT as f64) as u64;
-                let actual_piece_length = piece_length.next_power_of_two();
-
-                match (
-                    actual_piece_length > MIN_PIECE_LENGTH,
-                    actual_piece_length < MAX_PIECE_LENGTH,
-                ) {
-                    (true, true) => actual_piece_length,
-                    (_, false) => MAX_PIECE_LENGTH,
-                    (false, _) => MIN_PIECE_LENGTH,
-                }
-            }
-            PieceLengthStrategy::FixedPieceLength(piece_length) => piece_length,
-        }
+        resolve_piece_length(strategy)
     }
 
     /// Calculates the piece count by piece_length and content_length.
@@ -470,6 +468,20 @@ impl Piece {
     }
 
     /// Downloads a single piece from the source.
+    ///
+    /// `preserve_range` drives the signed-range fast path:
+    /// - `None`   → normal behaviour: rewrite `Range` to `bytes=offset-(offset+length-1)`.
+    /// - `Some(content_length)` → fast path: pass `range: None` to the backend so
+    ///   `make_request_headers` leaves the client's `Range` header verbatim
+    ///   (preserving the SigV4 signature). After the backend responds, two
+    ///   fail-closed checks are performed:
+    ///   1. The response must be `206 Partial Content` — any other status
+    ///      (including `200 OK`) means the server ignored the Range header and
+    ///      would produce data that does not fill this piece window.
+    ///   2. The `Content-Range` returned range must equal `[offset, offset+length-1]`
+    ///      and the total must equal `content_length` — S3 clamps ranges that
+    ///      extend past the end of the object, and a clamped response does not
+    ///      fill the piece window.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(piece_id))]
     pub async fn download_from_source(
@@ -482,6 +494,7 @@ impl Piece {
         length: u64,
         request_header: HeaderMap,
         is_prefetch: bool,
+        preserve_range: Option<u64>,
         object_storage: Option<ObjectStorage>,
         hdfs: Option<Hdfs>,
         hugging_face: Option<HuggingFace>,
@@ -541,15 +554,28 @@ impl Piece {
             http::Method::GET.as_str(),
         );
 
+        // Fast path: pass range: None so the client's signed Range header is
+        // forwarded verbatim. Normal path: overwrite Range with this piece's
+        // exact window.
+        let backend_range = if preserve_range.is_some() {
+            debug!(
+                "fast-path: forwarding signed Range verbatim for piece {} at offset {}",
+                piece_id, offset
+            );
+            None
+        } else {
+            Some(Range {
+                start: offset,
+                length,
+            })
+        };
+
         let mut response = backend
             .get(GetRequest {
                 task_id: task_id.to_string(),
                 piece_id: piece_id.to_string(),
                 url: url.to_string(),
-                range: Some(Range {
-                    start: offset,
-                    length,
-                }),
+                range: backend_range,
                 http_header: Some(request_header),
                 timeout: self.config.download.piece_timeout,
                 client_cert: None,
@@ -593,6 +619,86 @@ impl Piece {
                 status_code: Some(response.http_status_code.unwrap_or_default()),
                 header: Some(response.http_header.unwrap_or_default()),
             })));
+        }
+
+        // ── Fail-closed checks for the signed-range fast path ────────────────
+        // These correctness checks guard against silent data corruption:
+        // - S3 may clamp a range that extends past the object end, returning
+        //   fewer bytes than the piece window expects.
+        // - A 200 response means the server ignored Range entirely.
+        if let Some(asserted_content_length) = preserve_range {
+            let status = response.http_status_code.unwrap_or_default();
+            if status != reqwest::StatusCode::PARTIAL_CONTENT {
+                let mut buffer = String::new();
+                response
+                    .reader
+                    .read_to_string(&mut buffer)
+                    .await
+                    .unwrap_or_default();
+                let msg = format!(
+                    "fast-path: expected 206 Partial Content for piece {} at offset {}, got {status}",
+                    piece_id, offset
+                );
+                error!("{}", msg);
+                return Err(Error::BackendError(Box::new(BackendError {
+                    message: msg,
+                    status_code: Some(status),
+                    header: response.http_header,
+                })));
+            }
+
+            let header = response.http_header.as_ref();
+            let content_range = header.and_then(get_content_range);
+            match content_range {
+                None => {
+                    let msg = format!(
+                        "fast-path: missing or invalid Content-Range for piece {} at offset {}",
+                        piece_id, offset
+                    );
+                    error!("{}", msg);
+                    return Err(Error::BackendError(Box::new(BackendError {
+                        message: msg,
+                        status_code: Some(status),
+                        header: response.http_header,
+                    })));
+                }
+                Some((cr_start, cr_end, cr_total)) => {
+                    let expected_end = offset + length - 1;
+                    if cr_start != offset || cr_end != expected_end {
+                        let msg = format!(
+                            "fast-path: Content-Range bytes={cr_start}-{cr_end}/... \
+                             does not match expected bytes={offset}-{expected_end} \
+                             for piece {}",
+                            piece_id
+                        );
+                        error!("{}", msg);
+                        return Err(Error::BackendError(Box::new(BackendError {
+                            message: msg,
+                            status_code: Some(status),
+                            header: response.http_header,
+                        })));
+                    }
+                    if cr_total != asserted_content_length {
+                        let msg = format!(
+                            "fast-path: Content-Range total {cr_total} != \
+                             asserted content-length {asserted_content_length} \
+                             for piece {}",
+                            piece_id
+                        );
+                        error!("{}", msg);
+                        return Err(Error::BackendError(Box::new(BackendError {
+                            message: msg,
+                            status_code: Some(status),
+                            header: response.http_header,
+                        })));
+                    }
+                    debug!(
+                        "fast-path: Content-Range bytes={cr_start}-{cr_end}/{cr_total} \
+                         validated for piece {}",
+                        piece_id
+                    );
+                }
+            }
         }
 
         // Collect the backend request finished metrics.

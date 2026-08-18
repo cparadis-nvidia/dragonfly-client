@@ -48,7 +48,7 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_storage::{metadata, Storage};
 use dragonfly_client_util::{
-    http::{hashmap_to_headermap, headermap_to_hashmap},
+    http::{hashmap_to_headermap, headermap_to_hashmap, signature_bound_range_from_hashmap},
     id_generator::IDGenerator,
     shutdown,
 };
@@ -149,6 +149,14 @@ impl Task {
     }
 
     /// Updates the metadata of the task when the task downloads started.
+    ///
+    /// **Fast-path shortcut:** when the caller has pre-set both
+    /// `request.actual_content_length` and `request.actual_piece_length` before
+    /// calling this function, the `bytes=0-0` stat preflight is skipped entirely.
+    /// This is used for SigV4-signed range requests whose `Range` cannot be
+    /// modified without invalidating the signature. The stat itself would return
+    /// 403 in that case because it sends `Range: bytes=0-0` while leaving the
+    /// original `Authorization` intact.
     #[instrument(skip_all)]
     pub async fn download_started(
         &self,
@@ -178,8 +186,54 @@ impl Task {
                 }
             }
 
+            info!("task {} reused, skipping stat", id);
             return Ok(task);
         }
+
+        // ── Signed-range fast path ────────────────────────────────────────────
+        // When both actual_content_length and actual_piece_length are pre-set by
+        // the entry point (proxy or gRPC handler), the caller has already verified
+        // all alignment conditions and we can skip the bytes=0-0 stat preflight.
+        //
+        // TRADE-OFF: there is no stat response on this path, so there is no ETag,
+        // Content-Type, or Accept-Ranges to echo in the task's response_header.
+        // Clients using the fast path (e.g., the model-streamer) do not read those
+        // headers from proxied responses, so this omission is acceptable.
+        if let (Some(content_length), Some(piece_length)) =
+            (request.actual_content_length, request.actual_piece_length)
+        {
+            info!(
+                "fast-path: skipping stat for task {id}, \
+                 asserted content_length={content_length} piece_length={piece_length}"
+            );
+
+            if !task.is_finished() && !self.storage.has_enough_space(content_length)? {
+                return Err(Error::NoSpace(format!(
+                    "not enough space to store the task: content_length={content_length}"
+                )));
+            }
+
+            let task = self
+                .storage
+                .download_task_started(id, piece_length, content_length, None)
+                .await;
+
+            if let Some(output_path) = &request.output_path {
+                if let Err(err) = self
+                    .storage
+                    .hard_link_task(id, Path::new(output_path.as_str()))
+                    .await
+                {
+                    if request.force_hard_link {
+                        return Err(err);
+                    }
+                }
+            }
+
+            return task;
+        }
+
+        // ── Normal path: stat the origin to learn content_length ─────────────
 
         // Handle the request header.
         let mut request_header =
@@ -1608,6 +1662,10 @@ impl Task {
             .try_into()
             .or_err(ErrorType::ParseError)?;
 
+        // Detect signed-range fast path (same logic as download_partial_from_source).
+        let url_query = request.url.find('?').map(|i| &request.url[i + 1..]);
+        let signed_range = signature_bound_range_from_hashmap(&request.request_header, url_query);
+
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
 
@@ -1628,6 +1686,7 @@ impl Task {
                 request_header: HeaderMap,
                 is_prefetch: bool,
                 need_piece_content: bool,
+                preserve_range: Option<u64>,
                 piece_manager: Arc<piece::Piece>,
                 download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
                 in_stream_tx: Sender<AnnouncePeerRequest>,
@@ -1649,6 +1708,7 @@ impl Task {
                         length,
                         request_header,
                         is_prefetch,
+                        preserve_range,
                         object_storage,
                         hdfs,
                         hugging_face,
@@ -1766,6 +1826,27 @@ impl Task {
                 Ok(metadata)
             }
 
+            // Compute preserve_range for this piece.
+            let preserve_range: Option<u64> = signed_range.and_then(|(sr_start, sr_end)| {
+                let sr_length = sr_end.saturating_sub(sr_start).saturating_add(1);
+                if interested_piece.offset == sr_start && interested_piece.length == sr_length {
+                    let cl = task.content_length()?;
+                    debug!(
+                        "fast-path (scheduler): piece {} offset={} length={} matched signed \
+                         range bytes={sr_start}-{sr_end}, forwarding Range verbatim",
+                        interested_piece.number, interested_piece.offset, interested_piece.length
+                    );
+                    Some(cl)
+                } else {
+                    warn!(
+                        "fast-path (scheduler): piece {} offset={} length={} does not match \
+                         signed range bytes={sr_start}-{sr_end}, rewriting Range header",
+                        interested_piece.number, interested_piece.offset, interested_piece.length
+                    );
+                    None
+                }
+            });
+
             let task_id = task_id.to_string();
             let host_id = host_id.to_string();
             let peer_id = peer_id.to_string();
@@ -1793,6 +1874,7 @@ impl Task {
                         request_header,
                         request.is_prefetch,
                         request.need_piece_content,
+                        preserve_range,
                         piece_manager,
                         download_progress_tx,
                         in_stream_tx,
@@ -2177,6 +2259,13 @@ impl Task {
             .try_into()
             .or_err(ErrorType::ParseError)?;
 
+        // Detect whether this is a signed-range fast-path download. If the
+        // Range header is SigV4-signed (conditions 2, 3, 9) we must forward it
+        // verbatim to preserve the signature. `signed_range` carries the
+        // (start, end) of that range when active.
+        let url_query = request.url.find('?').map(|i| &request.url[i + 1..]);
+        let signed_range = signature_bound_range_from_hashmap(&request.request_header, url_query);
+
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
 
@@ -2197,6 +2286,10 @@ impl Task {
                 request_header: HeaderMap,
                 is_prefetch: bool,
                 need_piece_content: bool,
+                // When Some, the Range in request_header is signature-bound and
+                // exactly covers this piece; forward it verbatim and validate
+                // the response Content-Range against this content_length.
+                preserve_range: Option<u64>,
                 piece_manager: Arc<piece::Piece>,
                 download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
                 object_storage: Option<ObjectStorage>,
@@ -2217,6 +2310,7 @@ impl Task {
                         length,
                         request_header,
                         is_prefetch,
+                        preserve_range,
                         object_storage,
                         hdfs,
                         hugging_face,
@@ -2313,6 +2407,32 @@ impl Task {
                 Ok(metadata)
             }
 
+            // Compute preserve_range for this piece: only active when the
+            // signed range exactly covers this piece's window.
+            let preserve_range: Option<u64> = signed_range.and_then(|(sr_start, sr_end)| {
+                let sr_length = sr_end.saturating_sub(sr_start).saturating_add(1);
+                if interested_piece.offset == sr_start && interested_piece.length == sr_length {
+                    // Fast path: pass content_length for fail-closed validation.
+                    let cl = task.content_length()?;
+                    debug!(
+                        "fast-path: piece {} offset={} length={} matched signed range \
+                         bytes={sr_start}-{sr_end}, forwarding Range verbatim",
+                        interested_piece.number, interested_piece.offset, interested_piece.length
+                    );
+                    Some(cl)
+                } else {
+                    // Signed range mismatch: fall back to the normal Range rewrite.
+                    // This is unreachable on a well-formed fast-path request (the gate
+                    // in make_download_task_request ensures exactly one piece).
+                    warn!(
+                        "fast-path: piece {} offset={} length={} does not match signed range \
+                         bytes={sr_start}-{sr_end}, rewriting Range header",
+                        interested_piece.number, interested_piece.offset, interested_piece.length
+                    );
+                    None
+                }
+            });
+
             let task_id = task_id.to_string();
             let host_id = host_id.to_string();
             let peer_id = peer_id.to_string();
@@ -2339,6 +2459,7 @@ impl Task {
                         request_header,
                         request.is_prefetch,
                         request.need_piece_content,
+                        preserve_range,
                         piece_manager,
                         download_progress_tx,
                         object_storage,

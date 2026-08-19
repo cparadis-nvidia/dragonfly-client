@@ -217,6 +217,17 @@ impl Task {
                 .or_err(ErrorType::ParseError)?,
             );
 
+            // Some S3 clients (e.g. aws-c-s3 / the AWS CRT) hard-fail a GET
+            // response that lacks an ETag (AWS_ERROR_S3_MISSING_ETAG). The
+            // compact task never stats the origin, so synthesize a
+            // deterministic ETag from the task id: stable across peers and
+            // requests for the same range. TODO: capture the origin's real
+            // ETag when the piece is filled and store it in the task metadata.
+            response_header.insert(
+                reqwest::header::ETAG,
+                format!("\"dragonfly-{}\"", id).parse().or_err(ErrorType::ParseError)?,
+            );
+
             (compact.range.length, Some(response_header))
         } else {
             match get_task_content_length(&request_header) {

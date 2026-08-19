@@ -18,7 +18,7 @@ use crate::dynconfig::block_list::{DownloadBlockListCheckParams, UploadBlockList
 use crate::dynconfig::Dynconfig;
 use crate::resource::{persistent_cache_task, persistent_task, task};
 use dragonfly_api::common::v2::{
-    CacheTask, PersistentCacheTask, PersistentTask, Priority, Task, TaskType,
+    CacheTask, PersistentCacheTask, PersistentTask, Priority, Range, Task, TaskType,
 };
 use dragonfly_api::dfdaemon::v2::{
     dfdaemon_download_client::DfdaemonDownloadClient as DfdaemonDownloadGRPCClient,
@@ -62,7 +62,7 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_util::{
     digest::{is_blob_url, verify_file_digest, Digest},
-    http::{hashmap_to_headermap, headermap_to_hashmap, parse_range_header},
+    http::{get_compact_range, hashmap_to_headermap, headermap_to_hashmap, parse_range_header},
     id_generator::{PersistentCacheTaskIDParameter, PersistentTaskIDParameter, TaskIDParameter},
     ratelimiter::bbr::BBR,
     shutdown,
@@ -342,6 +342,23 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         // If concurrent_piece_count is not set in the request, use the default value in the config.
         download.concurrent_piece_count = Some(self.config.download.concurrent_piece_count);
 
+        // A request with a declared content length and a Range header is served
+        // as a compact range task: the task stores only the requested bytes and
+        // the source receives the client's original Range header unchanged,
+        // which keeps ranges covered by an upstream request signature (e.g.
+        // AWS SigV4) valid.
+        let compact_range = get_compact_range(&download.request_header, download.piece_length)
+            .map_err(|err| {
+                error!("get compact range failed: {}", err);
+                Status::invalid_argument(err.to_string())
+            })?;
+        if compact_range.is_some() {
+            // The whole object cannot be prefetched with the same request
+            // headers, and the range is derived from the request header below.
+            download.prefetch = false;
+            download.range = None;
+        }
+
         // Generate the task id.
         let task_id = self
             .task
@@ -372,6 +389,18 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
                 error!("generate task id: {}", e);
                 Status::invalid_argument(e.to_string())
             })?;
+
+        // Each distinct range of the same url is a separate compact range task,
+        // so a node caching one range does not allocate storage for the whole
+        // object.
+        let task_id = match compact_range {
+            Some(compact) => self.task.id_generator.range_task_id(
+                &task_id,
+                compact.range.start,
+                compact.range.length,
+            ),
+            None => task_id,
+        };
 
         // Generate the host id.
         let host_id = self.task.id_generator.host_id();
@@ -448,7 +477,26 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
         // Download's range priority is higher than the request header's range.
         // If download protocol is http, use the range of the request header.
         // If download protocol is not http, use the range of the download.
-        if download.range.is_none() {
+        if let Some(compact) = compact_range {
+            // A compact range task stores the requested source range at local
+            // offset zero, so the download range uses local coordinates.
+            if task.content_length() != Some(compact.range.length) {
+                error!(
+                    "compact range task content length {:?} mismatches the range length {}",
+                    task.content_length(),
+                    compact.range.length
+                );
+                return Err(Status::failed_precondition(format!(
+                    "compact range task content length mismatches the range length {}",
+                    compact.range.length
+                )));
+            }
+
+            download.range = Some(Range {
+                start: 0,
+                length: compact.range.length,
+            });
+        } else if download.range.is_none() {
             // Look up the range header directly instead of converting the whole
             // request header hashmap into a HeaderMap.
             let range_header = download
@@ -554,7 +602,10 @@ impl DfdaemonDownload for DfdaemonDownloadServerHandler {
                             return;
                         }
 
-                        if download_clone.range.is_none() {
+                        // A compact range task's content is exactly the
+                        // requested range, so it can be written to the output
+                        // path like a full task.
+                        if download_clone.range.is_none() || compact_range.is_some() {
                             if let Some(output_path) = &download_clone.output_path {
                                 if !download_clone.force_hard_link {
                                     let output_path = Path::new(output_path.as_str());

@@ -17,7 +17,7 @@
 use crate::grpc::{scheduler::SchedulerClient, REQUEST_TIMEOUT};
 use crate::resource::parent_selector::ParentSelector;
 use dragonfly_api::common::v2::{
-    Download, Hdfs, HuggingFace, ModelScope, ObjectStorage, Peer, Piece, Task as CommonTask,
+    Download, Hdfs, HuggingFace, ModelScope, ObjectStorage, Peer, Piece, Range, Task as CommonTask,
     TrafficType,
 };
 use dragonfly_api::dfdaemon::{
@@ -48,7 +48,9 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_storage::{metadata, Storage};
 use dragonfly_client_util::{
-    http::{hashmap_to_headermap, headermap_to_hashmap},
+    http::{
+        get_compact_range, get_task_content_length, hashmap_to_headermap, headermap_to_hashmap,
+    },
     id_generator::IDGenerator,
     shutdown,
 };
@@ -187,81 +189,123 @@ impl Task {
                 error!("convert header: {}", err);
             })?;
 
-        // Remove the range header to prevent the server from
-        // returning a 206 partial content and returning
-        // a 200 full content.
-        request_header.remove(reqwest::header::RANGE);
-
-        // Head the url to get the content length.
-        let backend = self.backend_factory.build(request.url.as_str())?;
-
-        // Record the start time.
-        let start_time = Instant::now();
-
-        // Collect the backend request started metrics.
-        collect_backend_request_started_metrics(
-            backend.scheme().as_str(),
-            http::Method::HEAD.as_str(),
-        );
-        let response = backend
-            .stat(StatRequest {
-                task_id: id.to_string(),
-                url: request.url,
-                http_header: Some(request_header),
-                timeout: self.config.download.piece_timeout,
-                client_cert: None,
-                object_storage: request.object_storage,
-                hdfs: request.hdfs,
-                hugging_face: request.hugging_face,
-                model_scope: request.model_scope,
-            })
-            .await
-            .inspect_err(|_err| {
-                // Collect the backend request failure metrics.
-                collect_backend_request_failure_metrics(
-                    backend.scheme().as_str(),
-                    http::Method::HEAD.as_str(),
-                );
+        // A compact range task stores only the requested byte range, so the
+        // task and its storage are sized by the range instead of the whole
+        // object. Its response header carries the source Content-Range, so
+        // responses report source object coordinates.
+        let compact_range = get_compact_range(&request.request_header, request.piece_length)
+            .inspect_err(|err| {
+                error!("get compact range failed: {}", err);
             })?;
 
-        // Check if the status code is success.
-        if !response.success {
-            // Collect the backend request failure metrics.
-            collect_backend_request_failure_metrics(
-                backend.scheme().as_str(),
-                http::Method::HEAD.as_str(),
+        // If the client declares the total content length with the
+        // X-Dragonfly-Content-Length header, skip the stat request to the
+        // origin. Besides saving the request, statting would rewrite the Range
+        // header, which invalidates ranges covered by an upstream request
+        // signature (e.g. AWS SigV4 with a signed Range header).
+        let (content_length, response_header) = if let Some(compact) = compact_range {
+            let mut response_header = HeaderMap::new();
+            response_header.insert(
+                reqwest::header::CONTENT_RANGE,
+                format!(
+                    "bytes {}-{}/{}",
+                    compact.range.start,
+                    compact.range.start + compact.range.length - 1,
+                    compact.total_content_length
+                )
+                .parse()
+                .or_err(ErrorType::ParseError)?,
             );
 
-            return Err(Error::BackendError(Box::new(BackendError {
-                message: response.error_message.unwrap_or_default(),
-                status_code: response.http_status_code,
-                header: response.http_header,
-            })));
-        }
+            (compact.range.length, Some(response_header))
+        } else {
+            match get_task_content_length(&request_header) {
+                Some(content_length) => (content_length, None),
+                None => {
+                    // Remove the range header to prevent the server from
+                    // returning a 206 partial content and returning
+                    // a 200 full content.
+                    request_header.remove(reqwest::header::RANGE);
 
-        // Collect the backend request finished metrics.
-        collect_backend_request_finished_metrics(
-            backend.scheme().as_str(),
-            http::Method::HEAD.as_str(),
-            start_time.elapsed(),
-        );
+                    // Head the url to get the content length.
+                    let backend = self.backend_factory.build(request.url.as_str())?;
 
-        let content_length = match response.content_length {
-            Some(content_length) => content_length,
-            None => return Err(Error::InvalidContentLength),
-        };
+                    // Record the start time.
+                    let start_time = Instant::now();
 
-        let piece_length = match request.piece_length {
-            Some(piece_length) => self
-                .piece
-                .calculate_piece_length(piece::PieceLengthStrategy::FixedPieceLength(piece_length)),
-            None => {
-                self.piece
-                    .calculate_piece_length(piece::PieceLengthStrategy::OptimizeByFileLength(
-                        content_length,
-                    ))
+                    // Collect the backend request started metrics.
+                    collect_backend_request_started_metrics(
+                        backend.scheme().as_str(),
+                        http::Method::HEAD.as_str(),
+                    );
+                    let response = backend
+                        .stat(StatRequest {
+                            task_id: id.to_string(),
+                            url: request.url,
+                            http_header: Some(request_header),
+                            timeout: self.config.download.piece_timeout,
+                            client_cert: None,
+                            object_storage: request.object_storage,
+                            hdfs: request.hdfs,
+                            hugging_face: request.hugging_face,
+                            model_scope: request.model_scope,
+                        })
+                        .await
+                        .inspect_err(|_err| {
+                            // Collect the backend request failure metrics.
+                            collect_backend_request_failure_metrics(
+                                backend.scheme().as_str(),
+                                http::Method::HEAD.as_str(),
+                            );
+                        })?;
+
+                    // Check if the status code is success.
+                    if !response.success {
+                        // Collect the backend request failure metrics.
+                        collect_backend_request_failure_metrics(
+                            backend.scheme().as_str(),
+                            http::Method::HEAD.as_str(),
+                        );
+
+                        return Err(Error::BackendError(Box::new(BackendError {
+                            message: response.error_message.unwrap_or_default(),
+                            status_code: response.http_status_code,
+                            header: response.http_header,
+                        })));
+                    }
+
+                    // Collect the backend request finished metrics.
+                    collect_backend_request_finished_metrics(
+                        backend.scheme().as_str(),
+                        http::Method::HEAD.as_str(),
+                        start_time.elapsed(),
+                    );
+
+                    let content_length = match response.content_length {
+                        Some(content_length) => content_length,
+                        None => return Err(Error::InvalidContentLength),
+                    };
+
+                    (content_length, response.http_header)
+                }
             }
         };
+
+        // A compact range task is a single piece, so its range can be fetched
+        // from the source with the client's original Range header unchanged.
+        let piece_length =
+            if compact_range.is_some() {
+                content_length
+            } else {
+                match request.piece_length {
+                    Some(piece_length) => self.piece.calculate_piece_length(
+                        piece::PieceLengthStrategy::FixedPieceLength(piece_length),
+                    ),
+                    None => self.piece.calculate_piece_length(
+                        piece::PieceLengthStrategy::OptimizeByFileLength(content_length),
+                    ),
+                }
+            };
 
         // If the task is not finished, check if the storage has enough space to
         // store the task.
@@ -273,7 +317,7 @@ impl Task {
 
         let task = self
             .storage
-            .download_task_started(id, piece_length, content_length, response.http_header)
+            .download_task_started(id, piece_length, content_length, response_header)
             .await;
 
         // Attempt to create a hard link from the task file to the output path.
@@ -1608,6 +1652,14 @@ impl Task {
             .try_into()
             .or_err(ErrorType::ParseError)?;
 
+        // A compact range task stores the requested source range at local
+        // offset zero, so its source request preserves the client's original
+        // Range header and is validated against the source range.
+        let compact_source_range =
+            get_compact_range(&request.request_header, request.piece_length)?
+                .filter(|compact| task.content_length() == Some(compact.range.length))
+                .map(|compact| compact.range);
+
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
 
@@ -1617,6 +1669,7 @@ impl Task {
             self.config.download.concurrent_piece_count as usize,
         ));
         for interested_piece in interested_pieces {
+            #[allow(clippy::too_many_arguments)]
             async fn download_from_source(
                 task_id: String,
                 host_id: String,
@@ -1627,6 +1680,7 @@ impl Task {
                 length: u64,
                 request_header: HeaderMap,
                 is_prefetch: bool,
+                source_range: Option<Range>,
                 need_piece_content: bool,
                 piece_manager: Arc<piece::Piece>,
                 download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
@@ -1649,6 +1703,7 @@ impl Task {
                         length,
                         request_header,
                         is_prefetch,
+                        source_range,
                         object_storage,
                         hdfs,
                         hugging_face,
@@ -1792,6 +1847,7 @@ impl Task {
                         interested_piece.length,
                         request_header,
                         request.is_prefetch,
+                        compact_source_range,
                         request.need_piece_content,
                         piece_manager,
                         download_progress_tx,
@@ -2177,6 +2233,14 @@ impl Task {
             .try_into()
             .or_err(ErrorType::ParseError)?;
 
+        // A compact range task stores the requested source range at local
+        // offset zero, so its source request preserves the client's original
+        // Range header and is validated against the source range.
+        let compact_source_range =
+            get_compact_range(&request.request_header, request.piece_length)?
+                .filter(|compact| task.content_length() == Some(compact.range.length))
+                .map(|compact| compact.range);
+
         // Initialize the finished pieces.
         let mut finished_pieces: Vec<metadata::Piece> = Vec::new();
 
@@ -2186,6 +2250,7 @@ impl Task {
             self.config.download.concurrent_piece_count as usize,
         ));
         for interested_piece in interested_pieces.clone() {
+            #[allow(clippy::too_many_arguments)]
             async fn download_from_source(
                 task_id: String,
                 host_id: String,
@@ -2196,6 +2261,7 @@ impl Task {
                 length: u64,
                 request_header: HeaderMap,
                 is_prefetch: bool,
+                source_range: Option<Range>,
                 need_piece_content: bool,
                 piece_manager: Arc<piece::Piece>,
                 download_progress_tx: Sender<Result<DownloadTaskResponse, Status>>,
@@ -2217,6 +2283,7 @@ impl Task {
                         length,
                         request_header,
                         is_prefetch,
+                        source_range,
                         object_storage,
                         hdfs,
                         hugging_face,
@@ -2338,6 +2405,7 @@ impl Task {
                         interested_piece.length,
                         request_header,
                         request.is_prefetch,
+                        compact_source_range,
                         request.need_piece_content,
                         piece_manager,
                         download_progress_tx,

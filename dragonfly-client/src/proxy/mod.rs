@@ -31,7 +31,7 @@ use dragonfly_client_metric::{
     collect_proxy_request_via_dfdaemon_metrics,
 };
 use dragonfly_client_util::{
-    http::{hashmap_to_headermap, headermap_to_hashmap},
+    http::{get_task_content_length, hashmap_to_headermap, headermap_to_hashmap},
     shutdown,
     tls::{generate_self_signed_certs_by_ca_cert, generate_simple_self_signed_certs, NoVerifier},
 };
@@ -1341,6 +1341,14 @@ fn need_prefetch(config: &Config, header: &http::HeaderMap) -> bool {
         return false;
     }
 
+    // A client that declares the content length with the X-Dragonfly-Content-Length
+    // header orchestrates its own ranged downloads (e.g. ranges covered by an AWS
+    // SigV4 signature, which the origin rejects without the exact signed Range
+    // header), so the full object cannot be prefetched with the same request headers.
+    if get_task_content_length(header).is_some() {
+        return false;
+    }
+
     // If the header contains the X-Dragonfly-Prefetch header, return the value.
     // Because the X-Dragonfly-Prefetch header has the highest priority.
     if let Some(prefetch) = header::get_prefetch(header) {
@@ -1385,18 +1393,22 @@ fn make_response_headers(
     // directly, instead of staging them in the hashmap and parsing them again.
     let mut headers = hashmap_to_headermap(&download_task_started_response.response_header)?;
 
-    // Insert the content range header to the response header.
+    // Insert the content range header to the response header. A compact range
+    // task already carries the source object's Content-Range in its response
+    // header, so keep it instead of rebuilding it from the local range.
     if let Some(range) = download_task_started_response.range.as_ref() {
-        headers.insert(
-            reqwest::header::CONTENT_RANGE,
-            hyper::header::HeaderValue::try_from(format!(
-                "bytes {}-{}/{}",
-                range.start,
-                range.start + range.length - 1,
-                download_task_started_response.content_length
-            ))
-            .or_err(ErrorType::ParseError)?,
-        );
+        if !headers.contains_key(reqwest::header::CONTENT_RANGE) {
+            headers.insert(
+                reqwest::header::CONTENT_RANGE,
+                hyper::header::HeaderValue::try_from(format!(
+                    "bytes {}-{}/{}",
+                    range.start,
+                    range.start + range.length - 1,
+                    download_task_started_response.content_length
+                ))
+                .or_err(ErrorType::ParseError)?,
+            );
+        }
 
         headers.insert(reqwest::header::CONTENT_LENGTH, range.length.into());
     };
@@ -1468,4 +1480,88 @@ fn empty() -> BoxBody<Bytes, ClientError> {
     Empty::<Bytes>::new()
         .map_err(|never| match never {})
         .boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dragonfly_api::common::v2::Range;
+
+    #[test]
+    fn test_make_response_headers_synthesizes_content_range() {
+        let started = DownloadTaskStartedResponse {
+            content_length: 1000,
+            range: Some(Range {
+                start: 100,
+                length: 100,
+            }),
+            ..Default::default()
+        };
+
+        let headers = make_response_headers(
+            "task-id",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            &started,
+        )
+        .unwrap();
+        assert_eq!(
+            headers.get(reqwest::header::CONTENT_RANGE).unwrap(),
+            "bytes 100-199/1000"
+        );
+        assert_eq!(headers.get(reqwest::header::CONTENT_LENGTH).unwrap(), "100");
+    }
+
+    #[test]
+    fn test_make_response_headers_keeps_compact_range_content_range() {
+        // A compact range task stores the requested bytes at local offset zero
+        // and carries the source object's Content-Range in its response header.
+        let mut started = DownloadTaskStartedResponse {
+            content_length: 100,
+            range: Some(Range {
+                start: 0,
+                length: 100,
+            }),
+            ..Default::default()
+        };
+        started.response_header.insert(
+            "content-range".to_string(),
+            "bytes 100-199/1000".to_string(),
+        );
+
+        let headers = make_response_headers(
+            "task-id",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            &started,
+        )
+        .unwrap();
+        assert_eq!(
+            headers.get(reqwest::header::CONTENT_RANGE).unwrap(),
+            "bytes 100-199/1000"
+        );
+        assert_eq!(headers.get(reqwest::header::CONTENT_LENGTH).unwrap(), "100");
+    }
+
+    #[test]
+    fn test_need_prefetch_skips_declared_content_length() {
+        let config = Arc::new(Config {
+            proxy: dragonfly_client_config::dfdaemon::Proxy {
+                prefetch: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let mut header = http::HeaderMap::new();
+        header.insert(
+            reqwest::header::RANGE,
+            http::HeaderValue::from_static("bytes=100-199"),
+        );
+        assert!(need_prefetch(&config, &header));
+
+        header.insert(
+            "X-Dragonfly-Content-Length",
+            http::HeaderValue::from_static("1000"),
+        );
+        assert!(!need_prefetch(&config, &header));
+    }
 }

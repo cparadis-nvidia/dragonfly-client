@@ -18,7 +18,7 @@ use crate::dynconfig::block_list::DownloadBlockListCheckParams;
 use crate::dynconfig::Dynconfig;
 use crate::grpc::DOWNLOAD_STREAM_BUFFER_SIZE;
 use crate::resource::task::Task;
-use dragonfly_api::common::v2::TaskType;
+use dragonfly_api::common::v2::{Range, TaskType};
 use dragonfly_api::dfdaemon::v2::{DownloadTaskRequest, DownloadTaskResponse};
 use dragonfly_api::errordetails::v2::Backend;
 use dragonfly_client_config::dfdaemon::Config;
@@ -30,7 +30,7 @@ use dragonfly_client_metric::{
 };
 use dragonfly_client_util::{
     digest::is_blob_url,
-    http::{headermap_to_hashmap, parse_range_header},
+    http::{get_compact_range, headermap_to_hashmap, parse_range_header},
     id_generator::TaskIDParameter,
     types::redacted::RedactedDownload,
 };
@@ -83,6 +83,22 @@ pub async fn download(
     // If concurrent_piece_count is not set in the request, use the default value in the config.
     download.concurrent_piece_count = Some(config.download.concurrent_piece_count);
 
+    // A request with a declared content length and a Range header is served as
+    // a compact range task: the task stores only the requested bytes and the
+    // source receives the client's original Range header unchanged, which
+    // keeps ranges covered by an upstream request signature (e.g. AWS SigV4)
+    // valid.
+    let compact_range = get_compact_range(&download.request_header, download.piece_length)
+        .inspect_err(|err| {
+            error!("get compact range failed: {}", err);
+        })?;
+    if compact_range.is_some() {
+        // The whole object cannot be prefetched with the same request headers,
+        // and the range is derived from the request header below.
+        download.prefetch = false;
+        download.range = None;
+    }
+
     // Generate the task id.
     let task_id = task_manager
         .id_generator
@@ -111,6 +127,17 @@ pub async fn download(
         .inspect_err(|err| {
             error!("generate task id: {}", err);
         })?;
+
+    // Each distinct range of the same url is a separate compact range task, so
+    // a node caching one range does not allocate storage for the whole object.
+    let task_id = match compact_range {
+        Some(compact) => task_manager.id_generator.range_task_id(
+            &task_id,
+            compact.range.start,
+            compact.range.length,
+        ),
+        None => task_id,
+    };
 
     // Generate the host id.
     let host_id = task_manager.id_generator.host_id();
@@ -165,7 +192,26 @@ pub async fn download(
     // Download's range priority is higher than the request header's range.
     // If download protocol is http, use the range of the request header.
     // If download protocol is not http, use the range of the download.
-    if download.range.is_none() {
+    if let Some(compact) = compact_range {
+        // A compact range task stores the requested source range at local
+        // offset zero, so the download range uses local coordinates.
+        if task.content_length() != Some(compact.range.length) {
+            error!(
+                "compact range task content length {:?} mismatches the range length {}",
+                task.content_length(),
+                compact.range.length
+            );
+            return Err(ClientError::ValidationError(format!(
+                "compact range task content length mismatches the range length {}",
+                compact.range.length
+            )));
+        }
+
+        download.range = Some(Range {
+            start: 0,
+            length: compact.range.length,
+        });
+    } else if download.range.is_none() {
         // Look up the range header directly instead of converting the whole
         // request header hashmap into a HeaderMap.
         let range_header = download

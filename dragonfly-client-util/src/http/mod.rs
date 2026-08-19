@@ -67,6 +67,138 @@ pub fn header_vec_to_headermap(raw_header: Vec<String>) -> Result<HeaderMap> {
     hashmap_to_headermap(&header_vec_to_hashmap(raw_header)?)
 }
 
+/// The X-Dragonfly-Content-Length header declares the total content length of
+/// the task up front, so dfdaemon can skip the ranged stat request to the
+/// origin. This also keeps requests whose Range header is covered by an
+/// upstream request signature (e.g. AWS SigV4 with a signed Range header)
+/// intact, because the stat request would rewrite the Range header and
+/// invalidate the signature.
+pub const DRAGONFLY_CONTENT_LENGTH_HEADER: &str = "X-Dragonfly-Content-Length";
+
+/// The X-Dragonfly-Piece-Offset header declares that the client's ranged
+/// requests are aligned to a chunk grid shifted by the given offset, e.g.
+/// ranged reads of a SafeTensors payload that starts after the file header.
+/// It is only a validation aid for compact range tasks: misaligned ranges are
+/// rejected early so all clients produce identical, cache-shareable ranges.
+/// It requires the X-Dragonfly-Content-Length header and a declared piece
+/// length.
+pub const DRAGONFLY_PIECE_OFFSET_HEADER: &str = "X-Dragonfly-Piece-Offset";
+
+/// Gets the content length declared by the X-Dragonfly-Content-Length header.
+pub fn get_task_content_length(header: &HeaderMap) -> Option<u64> {
+    header
+        .get(DRAGONFLY_CONTENT_LENGTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// A compact range task downloads and stores only the requested byte range of
+/// the source object, instead of allocating storage for the whole object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactRange {
+    /// The requested byte range in source object coordinates.
+    pub range: Range,
+
+    /// The total content length of the source object declared by the
+    /// X-Dragonfly-Content-Length header.
+    pub total_content_length: u64,
+}
+
+/// Returns the compact range task parameters when the client declares the
+/// total content length with the X-Dragonfly-Content-Length header and sends
+/// a Range header. Such a request is served as a compact range task: the task
+/// id is derived from the range, the task stores only the requested bytes and
+/// the source receives the client's original Range header unchanged, which
+/// keeps ranges covered by an upstream request signature (e.g. AWS SigV4)
+/// valid.
+///
+/// When the X-Dragonfly-Piece-Offset header is present, the range is
+/// additionally validated to cover exactly one chunk of the grid that starts
+/// at the offset with the declared piece length, so all clients chunk the
+/// object identically and share the same compact range tasks.
+pub fn get_compact_range(
+    header: &HashMap<String, String>,
+    piece_length: Option<u64>,
+) -> Result<Option<CompactRange>> {
+    let Some(total_content_length) = find_header(header, DRAGONFLY_CONTENT_LENGTH_HEADER)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return Ok(None);
+    };
+
+    let Some(range_header) = find_header(header, reqwest::header::RANGE.as_str()) else {
+        return Ok(None);
+    };
+    let range = parse_range_header(range_header, total_content_length)?;
+
+    if let Some(piece_offset) = find_header(header, DRAGONFLY_PIECE_OFFSET_HEADER) {
+        let piece_offset = piece_offset
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| Error::ValidationError(format!("invalid piece offset {piece_offset}")))?;
+        let Some(piece_length) = piece_length else {
+            return Err(Error::ValidationError(
+                "the X-Dragonfly-Piece-Offset header requires a declared piece length".to_string(),
+            ));
+        };
+
+        let aligned_start = range.start >= piece_offset
+            && piece_length > 0
+            && (range.start - piece_offset) % piece_length == 0;
+        // The trailing chunk is the only chunk shorter than the piece length.
+        let aligned_length = range.length == piece_length
+            || (range.start + range.length == total_content_length && range.length < piece_length);
+        if !aligned_start || !aligned_length {
+            return Err(Error::ValidationError(format!(
+                "range [{}, {}) is not aligned to the chunk grid with offset {} and piece length {}",
+                range.start,
+                range.start + range.length,
+                piece_offset,
+                piece_length
+            )));
+        }
+    }
+
+    Ok(Some(CompactRange {
+        range,
+        total_content_length,
+    }))
+}
+
+/// Finds a header value by case-insensitive name in a string header map.
+fn find_header<'a>(header: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    header
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// Returns whether a Range header value asks for exactly the bytes
+/// [start, start + length), using the absolute single-range form
+/// "bytes=<start>-<end>". Other range forms are never an exact match.
+pub fn is_exact_range(range_header_value: &str, start: u64, length: u64) -> bool {
+    if length == 0 {
+        return false;
+    }
+
+    let Some((unit, spec)) = range_header_value.split_once('=') else {
+        return false;
+    };
+    if !unit.trim().eq_ignore_ascii_case("bytes") {
+        return false;
+    }
+
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return false;
+    };
+
+    let Some(end) = start.checked_add(length - 1) else {
+        return false;
+    };
+
+    first.parse::<u64>().ok() == Some(start) && last.parse::<u64>().ok() == Some(end)
+}
+
 /// Gets the range from http header.
 pub fn get_range(header: &HeaderMap, content_length: u64) -> Result<Option<Range>> {
     match header.get(reqwest::header::RANGE) {
@@ -273,5 +405,173 @@ mod tests {
             header.insert(CONTENT_RANGE, HeaderValue::from_str(content_range).unwrap());
             assert!(validate_ranged_response(range, StatusCode::PARTIAL_CONTENT, &header).is_err());
         }
+    }
+
+    #[test]
+    fn test_get_task_content_length() {
+        let mut header = HeaderMap::new();
+        assert_eq!(get_task_content_length(&header), None);
+
+        header.insert(
+            DRAGONFLY_CONTENT_LENGTH_HEADER,
+            HeaderValue::from_static("4194304"),
+        );
+        assert_eq!(get_task_content_length(&header), Some(4194304));
+
+        header.insert(
+            DRAGONFLY_CONTENT_LENGTH_HEADER,
+            HeaderValue::from_static("not-a-number"),
+        );
+        assert_eq!(get_task_content_length(&header), None);
+    }
+
+    #[test]
+    fn test_get_compact_range() {
+        // Without the content length header there is no compact range task.
+        let header = HashMap::from([("range".to_string(), "bytes=100-199".to_string())]);
+        assert_eq!(get_compact_range(&header, None).unwrap(), None);
+
+        // Without a Range header there is no compact range task.
+        let header =
+            HashMap::from([("x-dragonfly-content-length".to_string(), "1000".to_string())]);
+        assert_eq!(get_compact_range(&header, None).unwrap(), None);
+
+        // An invalid content length disables the compact range task.
+        let header = HashMap::from([
+            ("x-dragonfly-content-length".to_string(), "oops".to_string()),
+            ("range".to_string(), "bytes=100-199".to_string()),
+        ]);
+        assert_eq!(get_compact_range(&header, None).unwrap(), None);
+
+        // The content length and a Range header form a compact range task,
+        // matched case-insensitively.
+        let header = HashMap::from([
+            ("X-Dragonfly-Content-Length".to_string(), "1000".to_string()),
+            ("Range".to_string(), "bytes=100-199".to_string()),
+        ]);
+        assert_eq!(
+            get_compact_range(&header, None).unwrap(),
+            Some(CompactRange {
+                range: Range {
+                    start: 100,
+                    length: 100,
+                },
+                total_content_length: 1000,
+            })
+        );
+
+        // A suffix range is resolved against the declared content length.
+        let header = HashMap::from([
+            ("x-dragonfly-content-length".to_string(), "1000".to_string()),
+            ("range".to_string(), "bytes=-100".to_string()),
+        ]);
+        assert_eq!(
+            get_compact_range(&header, None).unwrap(),
+            Some(CompactRange {
+                range: Range {
+                    start: 900,
+                    length: 100,
+                },
+                total_content_length: 1000,
+            })
+        );
+
+        // A range whose end exceeds the declared content length is clamped,
+        // matching how the origin serves it (RFC 7233).
+        let header = HashMap::from([
+            ("x-dragonfly-content-length".to_string(), "1000".to_string()),
+            ("range".to_string(), "bytes=900-1100".to_string()),
+        ]);
+        assert_eq!(
+            get_compact_range(&header, None).unwrap(),
+            Some(CompactRange {
+                range: Range {
+                    start: 900,
+                    length: 100,
+                },
+                total_content_length: 1000,
+            })
+        );
+
+        // A range that starts beyond the declared content length is rejected.
+        let header = HashMap::from([
+            ("x-dragonfly-content-length".to_string(), "1000".to_string()),
+            ("range".to_string(), "bytes=1000-1100".to_string()),
+        ]);
+        assert!(get_compact_range(&header, None).is_err());
+    }
+
+    #[test]
+    fn test_get_compact_range_validates_chunk_alignment() {
+        // A SafeTensors-like layout: the payload is chunked into 100 byte
+        // pieces from offset 8.
+        let header = |range: &str| {
+            HashMap::from([
+                ("x-dragonfly-content-length".to_string(), "458".to_string()),
+                ("x-dragonfly-piece-offset".to_string(), "8".to_string()),
+                ("range".to_string(), range.to_string()),
+            ])
+        };
+
+        // Aligned chunks, including the shorter trailing chunk.
+        for (range, expected_start, expected_length) in [
+            ("bytes=8-107", 8, 100),
+            ("bytes=208-307", 208, 100),
+            ("bytes=408-457", 408, 50),
+        ] {
+            assert_eq!(
+                get_compact_range(&header(range), Some(100)).unwrap(),
+                Some(CompactRange {
+                    range: Range {
+                        start: expected_start,
+                        length: expected_length,
+                    },
+                    total_content_length: 458,
+                }),
+                "{range} should be aligned"
+            );
+        }
+
+        // Misaligned ranges are rejected.
+        for range in [
+            // Starts before the grid offset.
+            "bytes=0-7",
+            // Not on a chunk boundary.
+            "bytes=100-199",
+            // Spans two chunks.
+            "bytes=8-207",
+            // Shorter than the piece length but not trailing.
+            "bytes=8-57",
+        ] {
+            assert!(
+                get_compact_range(&header(range), Some(100)).is_err(),
+                "{range} should be rejected"
+            );
+        }
+
+        // The piece offset requires a declared piece length.
+        assert!(get_compact_range(&header("bytes=8-107"), None).is_err());
+
+        // An invalid piece offset is rejected.
+        let mut invalid = header("bytes=8-107");
+        invalid.insert("x-dragonfly-piece-offset".to_string(), "oops".to_string());
+        assert!(get_compact_range(&invalid, Some(100)).is_err());
+    }
+
+    #[test]
+    fn test_is_exact_range() {
+        assert!(is_exact_range("bytes=100-199", 100, 100));
+        assert!(is_exact_range("bytes=0-0", 0, 1));
+        assert!(is_exact_range("BYTES = 100-199", 100, 100));
+
+        assert!(!is_exact_range("bytes=100-199", 100, 99));
+        assert!(!is_exact_range("bytes=100-199", 101, 100));
+        assert!(!is_exact_range("bytes=-50", 0, 50));
+        assert!(!is_exact_range("bytes=100-", 100, 100));
+        assert!(!is_exact_range("bytes=0-0,100-199", 0, 200));
+        assert!(!is_exact_range("items=100-199", 100, 100));
+        assert!(!is_exact_range("100-199", 100, 100));
+        assert!(!is_exact_range("bytes=100-199", 100, 0));
+        assert!(!is_exact_range("bytes=0-x", 0, u64::MAX));
     }
 }

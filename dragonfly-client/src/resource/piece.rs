@@ -25,7 +25,7 @@ use dragonfly_client_metric::{
     collect_backend_request_started_metrics, collect_download_piece_traffic_metrics,
 };
 use dragonfly_client_storage::{io::RangeReader, metadata, Storage};
-use dragonfly_client_util::net::format_socket_addr;
+use dragonfly_client_util::{http::validate_ranged_response, net::format_socket_addr};
 use leaky_bucket::RateLimiter;
 use reqwest::header::HeaderMap;
 use std::collections::HashMap;
@@ -470,6 +470,13 @@ impl Piece {
     }
 
     /// Downloads a single piece from the source.
+    ///
+    /// When source_range is set, the piece belongs to a compact range task: the
+    /// piece is stored at local offset zero while the source bytes live at
+    /// source_range. The request is sent with the client's original Range
+    /// header unchanged, so a range covered by an upstream request signature
+    /// (e.g. AWS SigV4 with a signed Range header) stays valid, and the
+    /// response is validated against source_range instead.
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, fields(piece_id))]
     pub async fn download_from_source(
@@ -482,6 +489,7 @@ impl Piece {
         length: u64,
         request_header: HeaderMap,
         is_prefetch: bool,
+        source_range: Option<Range>,
         object_storage: Option<ObjectStorage>,
         hdfs: Option<Hdfs>,
         hugging_face: Option<HuggingFace>,
@@ -541,15 +549,22 @@ impl Piece {
             http::Method::GET.as_str(),
         );
 
+        // For a compact range task, do not pass the piece range to the backend,
+        // so the client's original Range header reaches the source unchanged.
+        let range = match source_range {
+            Some(_) => None,
+            None => Some(Range {
+                start: offset,
+                length,
+            }),
+        };
+
         let mut response = backend
             .get(GetRequest {
                 task_id: task_id.to_string(),
                 piece_id: piece_id.to_string(),
                 url: url.to_string(),
-                range: Some(Range {
-                    start: offset,
-                    length,
-                }),
+                range,
                 http_header: Some(request_header),
                 timeout: self.config.download.piece_timeout,
                 client_cert: None,
@@ -593,6 +608,20 @@ impl Piece {
                 status_code: Some(response.http_status_code.unwrap_or_default()),
                 header: Some(response.http_header.unwrap_or_default()),
             })));
+        }
+
+        // The compact range request was sent without a backend range, so
+        // validate that the response satisfies the source range before caching
+        // the bytes.
+        if source_range.is_some() {
+            validate_ranged_response(
+                source_range,
+                response.http_status_code.unwrap_or_default(),
+                response.http_header.as_ref().unwrap_or(&HeaderMap::new()),
+            )
+            .inspect_err(|err| {
+                error!("backend get response is invalid: {}", err);
+            })?;
         }
 
         // Collect the backend request finished metrics.

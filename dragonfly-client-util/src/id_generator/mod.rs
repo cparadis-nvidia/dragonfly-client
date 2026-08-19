@@ -189,6 +189,23 @@ impl IDGenerator {
         }
     }
 
+    /// Derives the task id for a compact range task from the normal task id
+    /// and the requested byte range. Each distinct range of the same url is a
+    /// separate task that stores only the requested bytes, so a node caching
+    /// one range does not allocate storage for the whole object. The range is
+    /// hashed as parsed numbers, so different spellings of the same Range
+    /// header share the same task.
+    #[inline]
+    pub fn range_task_id(&self, task_id: &str, range_start: u64, range_length: u64) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(task_id.as_bytes());
+        hasher.update(b":range:");
+        hasher.update(range_start.to_string().as_bytes());
+        hasher.update(b"-");
+        hasher.update(range_length.to_string().as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     /// Generates the persistent task id.
     #[inline]
     pub fn persistent_task_id(&self, parameter: PersistentTaskIDParameter) -> Result<String> {
@@ -413,6 +430,18 @@ mod tests {
             let task_id = generator.task_id(parameter).unwrap();
             assert_eq!(task_id, expected_id);
         }
+    }
+
+    #[test]
+    fn should_generate_range_task_id() {
+        let generator = IDGenerator::new("127.0.0.1".to_string(), "localhost".to_string(), false);
+
+        let first = generator.range_task_id("base-task-id", 0, 100);
+        assert_eq!(first, generator.range_task_id("base-task-id", 0, 100));
+        assert_ne!(first, generator.range_task_id("base-task-id", 100, 100));
+        assert_ne!(first, generator.range_task_id("base-task-id", 0, 200));
+        assert_ne!(first, generator.range_task_id("other-task-id", 0, 100));
+        assert_ne!(first, "base-task-id");
     }
 
     #[test]

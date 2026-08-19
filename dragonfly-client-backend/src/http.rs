@@ -56,7 +56,10 @@ use dragonfly_client_core::{
     error::{ErrorType, OrErr},
     Error, Result,
 };
-use dragonfly_client_util::{http::validate_ranged_response, tls::NoVerifier};
+use dragonfly_client_util::{
+    http::{is_exact_range, validate_ranged_response},
+    tls::NoVerifier,
+};
 use futures::{StreamExt, TryStreamExt};
 use http::header::{
     HeaderName, HeaderValue, CONTENT_LENGTH, CONTENT_RANGE, LOCATION, RANGE, TRANSFER_ENCODING,
@@ -293,12 +296,22 @@ impl HTTP {
         request_header: &mut HeaderMap,
         range: Option<Range>,
     ) -> Result<()> {
-        // Add Range header if present in the request.
+        // Add Range header if present in the request. Keep the original Range
+        // header when it already asks for exactly the requested bytes, so a
+        // range covered by an upstream request signature (e.g. AWS SigV4 with
+        // a signed Range header) reaches the origin unchanged.
         if let Some(range) = &range {
-            request_header.insert(
-                RANGE,
-                format!("bytes={}-{}", range.start, range.start + range.length - 1).parse()?,
-            );
+            let exact_existing_range = request_header
+                .get(RANGE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| is_exact_range(value, range.start, range.length));
+
+            if !exact_existing_range {
+                request_header.insert(
+                    RANGE,
+                    format!("bytes={}-{}", range.start, range.start + range.length - 1).parse()?,
+                );
+            }
         };
 
         // Make the user agent if not specified in header.
@@ -1087,6 +1100,54 @@ LJ8gCHKBOJy9dW62DcRWw6zzlTtt9y18/Btx0Hpawg==
         });
 
         format!("https://localhost:{}", addr.port())
+    }
+
+    #[test]
+    fn should_preserve_exact_existing_range_header() {
+        let http = HTTP::new(HTTP_SCHEME, None, 1, true, Duration::from_secs(600), true).unwrap();
+
+        // The existing Range header asks for exactly the requested bytes, e.g.
+        // a Range covered by an AWS SigV4 signature, so it is kept unchanged.
+        let mut request_header = HeaderMap::new();
+        request_header.insert(
+            reqwest::header::RANGE,
+            HeaderValue::from_static("bytes = 100-199"),
+        );
+        http.make_request_headers(
+            &mut request_header,
+            Some(Range {
+                start: 100,
+                length: 100,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            request_header.get(reqwest::header::RANGE).unwrap(),
+            "bytes = 100-199"
+        );
+
+        // The existing Range header differs from the requested bytes, so it is
+        // rewritten to the requested range.
+        http.make_request_headers(
+            &mut request_header,
+            Some(Range {
+                start: 200,
+                length: 100,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            request_header.get(reqwest::header::RANGE).unwrap(),
+            "bytes=200-299"
+        );
+
+        // Without a requested range, the existing Range header is kept.
+        http.make_request_headers(&mut request_header, None)
+            .unwrap();
+        assert_eq!(
+            request_header.get(reqwest::header::RANGE).unwrap(),
+            "bytes=200-299"
+        );
     }
 
     #[tokio::test]
